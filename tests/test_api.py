@@ -784,3 +784,172 @@ def test_cancel_after_effective_time_conflicts(client):
     client.post("/decide", json={"request_id": "d1", "cost": 1})
     assert client.get("/policy-changes/ch2").json()["status"] == "applied"
     assert client.delete("/policy-changes/ch2").status_code == 409
+
+
+# ------------------------------------------------------------ 策略版本审计与回滚
+
+
+def get_history(client, scope, tenant=None, route=None):
+    params = {"scope": scope}
+    if tenant is not None:
+        params["tenant_id"] = tenant
+    if route is not None:
+        params["route_id"] = route
+    return client.get("/policies/history", params=params)
+
+
+def rollback(client, version, scope="global", tenant=None, route=None):
+    body = {"scope": scope, "tenant_id": tenant, "route_id": route,
+            "version": version}
+    return client.post("/policies/rollback", json=body)
+
+
+def test_put_appends_monotonic_versions(client):
+    put_policy(client, "global", 10, 1, threshold=2)
+    put_policy(client, "global", 20, 2)
+    r = get_history(client, "global")
+    assert r.status_code == 200
+    hist = r.json()
+    # 新到旧返回；版本号单调递增
+    assert [h["version"] for h in hist] == [2, 1]
+    assert all(h["source"] == "put" for h in hist)
+    assert all(h["scope"] == "global" for h in hist)
+    assert all(h["tenant_id"] is None and h["route_id"] is None for h in hist)
+    assert all(h["created_at"] for h in hist)
+    # 完整参数快照（含阈值；PUT 全量替换后第二次为关闭）
+    assert hist[1]["capacity"] == 10.0
+    assert hist[1]["refill_rate"] == 1.0
+    assert hist[1]["low_balance_threshold"] == 2.0
+    assert hist[0]["capacity"] == 20.0
+    assert hist[0]["refill_rate"] == 2.0
+    assert hist[0]["low_balance_threshold"] is None
+
+
+def test_history_is_per_policy_and_validates_key(client):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 5, 0, tenant="acme")
+    put_policy(client, "tenant", 6, 0, tenant="acme")
+    put_policy(client, "route", 3, 0, tenant="acme", route="/r")
+
+    assert [h["version"] for h in get_history(client, "global").json()] == [1]
+    t = get_history(client, "tenant", tenant="acme").json()
+    assert [h["version"] for h in t] == [2, 1]
+    assert t[0]["capacity"] == 6.0
+    r = get_history(client, "route", tenant="acme", route="/r").json()
+    assert [h["version"] for h in r] == [1]
+    assert r[0]["tenant_id"] == "acme" and r[0]["route_id"] == "/r"
+    # 无历史的策略 -> 空列表
+    assert get_history(client, "tenant", tenant="ghost").json() == []
+    # tenant/route 作用域缺键 -> 422；缺 scope -> 422
+    assert get_history(client, "tenant").status_code == 422
+    assert get_history(client, "route", tenant="acme").status_code == 422
+    assert client.get("/policies/history").status_code == 422
+
+
+def test_scheduled_change_appends_version(client):
+    put_policy(client, "global", 100, 0)
+    post_change(client, "ch1", "global", 50, 5, threshold=3, effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    client.post("/decide", json={"request_id": "d1", "cost": 1})
+
+    hist = get_history(client, "global").json()
+    assert [h["version"] for h in hist] == [2, 1]
+    assert hist[0]["source"] == "scheduled"
+    assert hist[0]["capacity"] == 50.0
+    assert hist[0]["refill_rate"] == 5.0
+    assert hist[0]["low_balance_threshold"] == 3.0
+    assert hist[1]["source"] == "put"
+
+
+def test_rollback_restores_params_and_appends_version(client):
+    put_policy(client, "global", 10, 1, threshold=2)
+    put_policy(client, "global", 100, 5)
+
+    r = rollback(client, 1)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["capacity"] == 10.0
+    assert body["refill_rate"] == 1.0
+    assert body["low_balance_threshold"] == 2.0
+
+    # 当前策略已恢复为目标版本
+    cur = client.get("/policies").json()[0]
+    assert cur["capacity"] == 10.0 and cur["refill_rate"] == 1.0
+    assert cur["low_balance_threshold"] == 2.0
+
+    # 回滚生成 source=rollback 的新版本，版本号继续递增
+    hist = get_history(client, "global").json()
+    assert [h["version"] for h in hist] == [3, 2, 1]
+    assert hist[0]["source"] == "rollback"
+    assert hist[0]["capacity"] == 10.0
+    assert hist[0]["low_balance_threshold"] == 2.0
+
+    # 回滚后再 PUT，版本号继续单调递增
+    put_policy(client, "global", 7, 0)
+    hist = get_history(client, "global").json()
+    assert [h["version"] for h in hist] == [4, 3, 2, 1]
+    assert hist[0]["source"] == "put"
+
+
+def test_rollback_refills_with_current_policy_then_clamps(client):
+    # v1: 容量 10 速率 0；v2: 容量 100 速率 10。花 50 -> 余 50，
+    # 回滚到 v1 前先按当前策略（10/s）补充到事务时刻，再截断到目标容量 10
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "global", 100, 10)
+    client.post("/decide", json={"request_id": "d1", "cost": 50})
+
+    import time
+    time.sleep(0.2)
+    assert rollback(client, 1).status_code == 200
+    b = client.get("/buckets").json()[0]
+    assert b["capacity"] == 10.0
+    assert b["refill_rate"] == 0.0
+    assert b["balance"] == pytest.approx(10.0, abs=1e-6)
+
+    # 恢复后的策略立即生效：容量 10、速率 0，cost 11 永不可能
+    r = client.post("/decide", json={"request_id": "d2", "cost": 11}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is False
+
+
+def test_rollback_route_scoped_policy(client):
+    put_policy(client, "route", 4, 0, tenant="acme", route="/r")
+    put_policy(client, "route", 40, 0, tenant="acme", route="/r")
+    r = rollback(client, 1, scope="route", tenant="acme", route="/r")
+    assert r.status_code == 200
+    assert r.json()["capacity"] == 4.0
+    hist = get_history(client, "route", tenant="acme", route="/r").json()
+    assert [h["version"] for h in hist] == [3, 2, 1]
+    assert hist[0]["source"] == "rollback"
+    # 其它策略的历史不受影响
+    assert get_history(client, "global").json() == []
+
+
+def test_rollback_conflict_with_pending_change(client):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "global", 20, 0)
+    post_change(client, "ch1", "global", 30, 0, effective_in=3600)
+
+    r = rollback(client, 1)
+    assert r.status_code == 409
+    # 冲突时策略未被改动，也没有追加版本
+    assert client.get("/policies").json()[0]["capacity"] == 20.0
+    assert [h["version"] for h in get_history(client, "global").json()] == [2, 1]
+
+    # 取消 pending 后回滚恢复可用
+    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert rollback(client, 1).status_code == 200
+    assert client.get("/policies").json()[0]["capacity"] == 10.0
+
+
+def test_rollback_unknown_policy_or_version_404(client):
+    put_policy(client, "global", 10, 0)
+    # 未知策略 -> 404
+    assert rollback(client, 1, scope="tenant", tenant="ghost").status_code == 404
+    # 未知版本 -> 404
+    assert rollback(client, 99).status_code == 404
+    # version 必须 >= 1；scope 组合非法 -> 422
+    assert rollback(client, 0).status_code == 422
+    assert rollback(client, 1, scope="route", tenant="acme").status_code == 422

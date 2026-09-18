@@ -94,6 +94,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_changes_one_pending
 ON policy_changes (scope, tenant_id, route_id)
 WHERE status = 'pending';
 
+-- 策略版本审计：每次 PUT 成功、定时切换实际生效、回滚成功都会追加一条
+-- 不可变记录；同一策略 (scope, tenant_id, route_id) 的 version 单调递增。
+-- source: 'put'（PUT /policies）| 'scheduled'（定时切换生效）| 'rollback'（回滚）
+CREATE TABLE IF NOT EXISTS policy_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope        TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    route_id     TEXT NOT NULL DEFAULT '',
+    version      INTEGER NOT NULL CHECK (version >= 1),
+    capacity     REAL NOT NULL CHECK (capacity >= 0),
+    refill_rate  REAL NOT NULL CHECK (refill_rate >= 0),
+    low_balance_threshold REAL
+        CHECK (low_balance_threshold IS NULL OR low_balance_threshold >= 0),
+    source       TEXT NOT NULL
+                 CHECK (source IN ('put', 'scheduled', 'rollback')),
+    created_at   TEXT NOT NULL,
+    UNIQUE (scope, tenant_id, route_id, version)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
