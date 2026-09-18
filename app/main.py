@@ -24,6 +24,8 @@ from .schemas import (
     PolicyChangeOut,
     PolicyIn,
     PolicyOut,
+    PolicyRollbackIn,
+    PolicyVersionOut,
     RevokeOut,
 )
 
@@ -41,9 +43,10 @@ app = FastAPI(
         "一次裁决在同一事务中补充并扣减所有命中桶，全部满足才扣减；"
         "request_id 幂等重放；支持撤销补回；"
         "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
-        "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用。"
+        "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用；"
+        "策略变更追加不可变版本记录，支持历史查询与同事务回滚。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -82,6 +85,50 @@ def put_policy(
             capacity=body.capacity,
             refill_rate=body.refill_rate,
             low_balance_threshold=body.low_balance_threshold,
+        )
+
+
+@app.get(
+    "/policies/history",
+    response_model=list[PolicyVersionOut],
+    tags=["策略版本审计"],
+)
+def get_policy_history(
+    scope: str = Query(..., pattern="^(global|tenant|route)$"),
+    tenant_id: str | None = Query(default=None),
+    route_id: str | None = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict]:
+    """查询单个策略的不可变版本历史，按版本号新到旧返回。只读。"""
+    return quota.list_policy_versions(
+        conn, scope=scope, tenant_id=tenant_id, route_id=route_id
+    )
+
+
+@app.post(
+    "/policies/rollback",
+    response_model=PolicyVersionOut,
+    tags=["策略版本审计"],
+    responses={
+        404: {"description": "目标策略或版本不存在"},
+        409: {"description": "该策略存在待生效（pending）的定时变更"},
+    },
+)
+def post_policy_rollback(
+    body: PolicyRollbackIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """在同一写事务内把策略恢复到指定历史版本。
+
+    已有桶先按当前策略补充到事务时刻，再按目标版本容量截断；
+    恢复成功会追加一条 source=rollback 的新版本（版本号继续递增）。
+    """
+    with write_tx(conn):
+        return quota.rollback_policy(
+            conn,
+            scope=body.scope,
+            tenant_id=body.tenant_id,
+            route_id=body.route_id,
+            version=body.version,
         )
 
 

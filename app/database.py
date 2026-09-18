@@ -94,6 +94,47 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_changes_one_pending
 ON policy_changes (scope, tenant_id, route_id)
 WHERE status = 'pending';
 
+-- 策略版本审计：每次 PUT /policies 成功、定时切换实际生效、回滚成功，
+-- 都在同一写事务内追加一条不可变记录（版本号在同一策略内单调递增）。
+-- source: put（PUT /policies）| scheduled（定时切换到期生效）
+--       | rollback（POST /policies/rollback）| baseline（老库迁移补登）
+-- change_id 仅 scheduled 版本有值；restored_from_version 仅 rollback 版本有值。
+-- 只追加不修改不删除，故不建外键约束，保证审计链永不因级联而缺失。
+CREATE TABLE IF NOT EXISTS policy_versions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope                   TEXT NOT NULL,
+    tenant_id               TEXT NOT NULL DEFAULT '',
+    route_id                TEXT NOT NULL DEFAULT '',
+    version                 INTEGER NOT NULL CHECK (version >= 1),
+    capacity                REAL NOT NULL CHECK (capacity >= 0),
+    refill_rate             REAL NOT NULL CHECK (refill_rate >= 0),
+    low_balance_threshold   REAL
+        CHECK (low_balance_threshold IS NULL OR low_balance_threshold >= 0),
+    source                  TEXT NOT NULL
+        CHECK (source IN ('put', 'scheduled', 'rollback', 'baseline')),
+    change_id               TEXT,
+    restored_from_version   INTEGER,
+    created_at              TEXT NOT NULL
+) STRICT;
+
+-- 版本历史按策略键查询、版本号单调；同策略版本号唯一
+CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_versions_key_version
+ON policy_versions (scope, tenant_id, route_id, version);
+
+-- 审计表只追加：触发器在数据库层拒绝任何 UPDATE / DELETE（含手工 SQL），
+-- 版本链一旦写入即不可篡改
+CREATE TRIGGER IF NOT EXISTS trg_policy_versions_no_update
+BEFORE UPDATE ON policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 UPDATE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_policy_versions_no_delete
+BEFORE DELETE ON policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 DELETE');
+END;
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -142,6 +183,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE policies ADD COLUMN low_balance_threshold REAL "
             "CHECK (low_balance_threshold IS NULL OR low_balance_threshold >= 0)"
         )
+
+    # 老库（或上个版本写入的策略）首次升级时，按当前策略为尚无版本记录的
+    # 策略补登一条 version=1 的 baseline，时间取策略 updated_at。
+    # 之后所有策略版本都从 2 开始单调递增；重复启动幂等。
+    conn.execute(
+        """
+        INSERT INTO policy_versions
+            (scope, tenant_id, route_id, version, capacity, refill_rate,
+             low_balance_threshold, source, change_id, restored_from_version,
+             created_at)
+        SELECT p.scope, p.tenant_id, p.route_id, 1, p.capacity, p.refill_rate,
+               p.low_balance_threshold, 'baseline', NULL, NULL, p.updated_at
+        FROM policies p
+        WHERE NOT EXISTS (
+            SELECT 1 FROM policy_versions v
+            WHERE v.scope = p.scope
+              AND v.tenant_id = p.tenant_id
+              AND v.route_id = p.route_id
+        )
+        """
+    )
 
 
 @contextmanager

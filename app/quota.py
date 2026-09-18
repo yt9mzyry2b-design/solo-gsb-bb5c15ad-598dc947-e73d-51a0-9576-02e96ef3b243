@@ -179,6 +179,14 @@ def upsert_policy(
             iso(ts),
         ),
     )
+    # 每次 PUT 成功都在同一事务追加一条不可变版本（source=put）
+    _append_policy_version(
+        conn,
+        scope=scope, tenant=tenant, route=route,
+        capacity=capacity, refill_rate=refill_rate,
+        low_balance_threshold=low_balance_threshold,
+        source="put", created_at=iso(ts),
+    )
     row = conn.execute(
         "SELECT scope, tenant_id, route_id, capacity, refill_rate, "
         "low_balance_threshold, updated_at "
@@ -186,6 +194,189 @@ def upsert_policy(
         (scope, tenant, route),
     ).fetchone()
     return _policy_out(row)
+
+
+# ------------------------------------------------------------ 策略版本审计
+
+
+_VERSION_COLS = (
+    "version, scope, tenant_id, route_id, capacity, refill_rate, "
+    "low_balance_threshold, source, change_id, restored_from_version, created_at"
+)
+
+
+def _version_out(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "version": row["version"],
+        "scope": row["scope"],
+        "tenant_id": row["tenant_id"] or None,
+        "route_id": row["route_id"] or None,
+        "capacity": row["capacity"],
+        "refill_rate": row["refill_rate"],
+        "low_balance_threshold": row["low_balance_threshold"],
+        "source": row["source"],
+        "change_id": row["change_id"],
+        "restored_from_version": row["restored_from_version"],
+        "created_at": row["created_at"],
+    }
+
+
+def _next_version(
+    conn: sqlite3.Connection, scope: str, tenant: str, route: str
+) -> int:
+    """在写事务内分配该策略的下一个版本号（max(version)+1，首个为 1）。
+
+    所有调用方都在 BEGIN IMMEDIATE 事务内，写锁已排他持有，
+    max 读与随后的插入之间不会有其他写者插入。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM policy_versions "
+        "WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    return int(row["v"]) + 1
+
+
+def _append_policy_version(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    tenant: str,
+    route: str,
+    capacity: float,
+    refill_rate: float,
+    low_balance_threshold: Optional[float],
+    source: str,
+    created_at: str,
+    change_id: Optional[str] = None,
+    restored_from_version: Optional[int] = None,
+) -> dict[str, Any]:
+    """在当前写事务内追加一条不可变版本记录并返回它。
+
+    与触发变更（PUT 成功 / 定时切换生效 / 回滚成功）在同一事务内提交，
+    保证「策略参数已变」与「版本已落账」要么同时可见要么都不可见。
+    """
+    version = _next_version(conn, scope, tenant, route)
+    conn.execute(
+        """
+        INSERT INTO policy_versions
+            (scope, tenant_id, route_id, version, capacity, refill_rate,
+             low_balance_threshold, source, change_id, restored_from_version,
+             created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            scope, tenant, route, version, float(capacity), float(refill_rate),
+            None if low_balance_threshold is None else float(low_balance_threshold),
+            source, change_id, restored_from_version, created_at,
+        ),
+    )
+    row = conn.execute(
+        f"SELECT {_VERSION_COLS} FROM policy_versions "
+        "WHERE scope=? AND tenant_id=? AND route_id=? AND version=?",
+        (scope, tenant, route, version),
+    ).fetchone()
+    return _version_out(row)
+
+
+def list_policy_versions(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    tenant_id: Optional[str] = None,
+    route_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """按策略键返回版本历史，新版本在前（version 降序）。只读。"""
+    tenant, route = _normalize_scope(scope, tenant_id, route_id)
+    rows = conn.execute(
+        f"SELECT {_VERSION_COLS} FROM policy_versions "
+        "WHERE scope=? AND tenant_id=? AND route_id=? "
+        "ORDER BY version DESC, id DESC",
+        (scope, tenant, route),
+    ).fetchall()
+    return [_version_out(r) for r in rows]
+
+
+def rollback_policy(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+    version: int,
+) -> dict[str, Any]:
+    """在同一写事务内把策略恢复到指定历史版本，并追加一条 source=rollback 版本。
+
+    约束：目标策略不存在 -> 404；目标版本不属于该策略 -> 404；
+    该策略存在 pending 定时变更 -> 409（避免与到期应用交错）。
+    桶按 PUT 相同规则处理：先按当前策略补充到事务时刻，再按目标容量截断。
+    """
+    tenant, route = _normalize_scope(scope, tenant_id, route_id)
+
+    pending = _pending_change(conn, scope, tenant, route)
+    if pending is not None:
+        raise HTTPException(
+            409,
+            f"该策略存在待生效的定时变更 change_id={pending['change_id']!r}"
+            f"（effective_at={pending['effective_at']}），请先取消或等其生效后再回滚",
+        )
+
+    current = conn.execute(
+        "SELECT capacity, refill_rate, low_balance_threshold FROM policies "
+        "WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    if current is None:
+        raise HTTPException(404, "目标策略不存在，请先用 PUT /policies 创建")
+
+    target = conn.execute(
+        f"SELECT {_VERSION_COLS} FROM policy_versions "
+        "WHERE scope=? AND tenant_id=? AND route_id=? AND version=?",
+        (scope, tenant, route, version),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(
+            404, f"版本 version={version} 不属于该策略，无法回滚"
+        )
+
+    cap = float(target["capacity"])
+    rate = float(target["refill_rate"])
+    threshold = target["low_balance_threshold"]
+
+    ts = now_utc()
+    # 已有桶：先按当前策略补充到事务时刻，再截断到目标版本容量
+    bucket = conn.execute(
+        "SELECT balance, updated_at FROM buckets "
+        "WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    if bucket is not None:
+        balance = _refill(
+            bucket["balance"], bucket["updated_at"],
+            current["capacity"], current["refill_rate"], ts,
+        )
+        balance = min(balance, cap)
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (balance, iso(ts), scope, tenant, route),
+        )
+
+    conn.execute(
+        """
+        UPDATE policies
+        SET capacity=?, refill_rate=?, low_balance_threshold=?, updated_at=?
+        WHERE scope=? AND tenant_id=? AND route_id=?
+        """,
+        (cap, rate, threshold, iso(ts), scope, tenant, route),
+    )
+    return _append_policy_version(
+        conn,
+        scope=scope, tenant=tenant, route=route,
+        capacity=cap, refill_rate=rate, low_balance_threshold=threshold,
+        source="rollback", created_at=iso(ts),
+        restored_from_version=version,
+    )
 
 
 def _policy_out(row: sqlite3.Row) -> dict[str, Any]:
@@ -534,11 +725,22 @@ def _apply_policy_change(
             scope, tenant, route,
         ),
     )
-    conn.execute(
+    cur = conn.execute(
         "UPDATE policy_changes SET status='applied', applied_at=? "
         "WHERE change_id=? AND status='pending'",
         (iso(now), ch["change_id"]),
     )
+    if cur.rowcount > 0:
+        # 定时切换实际生效（由本次裁决/撤销事务抢到 pending -> applied）时，
+        # 在同一事务追加不可变版本（source=scheduled）
+        _append_policy_version(
+            conn,
+            scope=scope, tenant=tenant, route=route,
+            capacity=new_cap, refill_rate=new_rate,
+            low_balance_threshold=new_threshold,
+            source="scheduled", created_at=iso(now),
+            change_id=ch["change_id"],
+        )
 
 
 def _maybe_emit_low_balance(

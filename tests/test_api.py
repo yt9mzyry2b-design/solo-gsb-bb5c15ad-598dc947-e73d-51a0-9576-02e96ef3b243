@@ -65,6 +65,22 @@ def post_change(client, change_id, scope, capacity, refill_rate, *,
     return client.post("/policy-changes", json=body)
 
 
+def rollback(client, scope, version, tenant=None, route=None):
+    return client.post(
+        "/policies/rollback",
+        json={
+            "scope": scope,
+            "tenant_id": tenant,
+            "route_id": route,
+            "version": version,
+        },
+    )
+
+
+def history(client, scope, **params):
+    return client.get("/policies/history", params={"scope": scope, **params})
+
+
 # ------------------------------------------------------------ 基本扣减与拒绝
 
 
@@ -784,3 +800,263 @@ def test_cancel_after_effective_time_conflicts(client):
     client.post("/decide", json={"request_id": "d1", "cost": 1})
     assert client.get("/policy-changes/ch2").json()["status"] == "applied"
     assert client.delete("/policy-changes/ch2").status_code == 409
+
+
+# ------------------------------------------------------------ 策略版本审计与回滚
+
+
+def test_put_appends_monotonic_versions_and_history(client):
+    r = put_policy(client, "global", 100, 0, threshold=10)
+    assert r.status_code == 200
+    put_policy(client, "global", 50, 1, threshold=5)
+    put_policy(client, "tenant", 8, 2, tenant="t", threshold=1)
+
+    h = history(client, "global").json()
+    # 新到旧：version 2 在前
+    assert [v["version"] for v in h] == [2, 1]
+    v2, v1 = h
+    assert v1["source"] == "put"
+    assert v1["capacity"] == 100.0 and v1["refill_rate"] == 0.0
+    assert v1["low_balance_threshold"] == 10.0
+    assert v1["change_id"] is None and v1["restored_from_version"] is None
+    assert v1["created_at"]
+    assert v2["capacity"] == 50.0 and v2["refill_rate"] == 1.0
+    assert v2["low_balance_threshold"] == 5.0
+    # 历史只含该策略：tenant 策略不在 global 历史里
+    assert all(v["scope"] == "global" for v in h)
+    th = history(client, "tenant", tenant_id="t").json()
+    assert [v["version"] for v in th] == [1]
+    assert th[0]["capacity"] == 8.0
+    assert th[0]["tenant_id"] == "t" and th[0]["route_id"] is None
+    # PUT 为全量替换：不传阈值即关闭，也应有独立版本
+    put_policy(client, "global", 50, 1)
+    assert history(client, "global").json()[0]["low_balance_threshold"] is None
+
+
+def test_history_filters_by_policy_key(client):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 10, 0, tenant="t1")
+    put_policy(client, "route", 10, 0, tenant="t1", route="rA")
+    # 不同策略键各自独立计数
+    assert history(client, "global").json()[0]["version"] == 1
+    assert history(client, "tenant", tenant_id="t1").json()[0]["version"] == 1
+    assert history(client, "route", tenant_id="t1", route_id="rA").json()[0][
+        "version"
+    ] == 1
+    # scope 必传 / 非法组合 -> 422
+    assert client.get("/policies/history").status_code == 422
+    assert client.get(
+        "/policies/history", params={"scope": "wat"}
+    ).status_code == 422
+    assert history(client, "tenant").status_code == 422
+    assert history(client, "route", tenant_id="t1").status_code == 422
+    # 从未创建过的策略：历史为空（不报错）
+    assert history(client, "tenant", tenant_id="nope").json() == []
+
+
+def test_rollback_restores_parameters_and_appends_version(client):
+    put_policy(client, "global", 100, 0, threshold=10)  # v1
+    put_policy(client, "global", 50, 1, threshold=5)    # v2
+    put_policy(client, "global", 20, 2)                 # v3
+
+    r = rollback(client, "global", 1)
+    assert r.status_code == 200
+    nv = r.json()
+    assert nv["version"] == 4
+    assert nv["source"] == "rollback"
+    assert nv["restored_from_version"] == 1
+    assert nv["capacity"] == 100.0
+    assert nv["refill_rate"] == 0.0
+    assert nv["low_balance_threshold"] == 10.0
+    # 策略本身已恢复
+    p = client.get("/policies").json()[0]
+    assert p["capacity"] == 100.0 and p["refill_rate"] == 0.0
+    assert p["low_balance_threshold"] == 10.0
+    # 历史新到旧，回滚版本在最前
+    h = history(client, "global").json()
+    assert [v["version"] for v in h] == [4, 3, 2, 1]
+    assert h[0]["source"] == "rollback"
+    assert h[1]["source"] == "put"
+    # 回滚后裁决按恢复后的策略走：容量 100
+    d = client.post("/decide", json={"request_id": "d1", "cost": 100}).json()
+    assert d["allowed"] is True
+    assert d["buckets"][0]["balance"] == 0.0
+
+
+def test_rollback_clamps_existing_bucket_to_target_capacity(client):
+    # v1 容量 20、速率 0：花掉 5 -> 余 15；v2 容量 100、速率 100。
+    # v2 生效后桶被补满到 100；回滚到 v1（容量 20）时先按当前策略补充，
+    # 再截断回 20。
+    put_policy(client, "global", 20, 0)
+    client.post("/decide", json={"request_id": "d1", "cost": 5})
+    put_policy(client, "global", 100, 100)
+
+    import time
+    time.sleep(1.0)
+    # 一次裁决把补充后的高余额落库：补满到 100 再扣 1 -> 99
+    d = client.post("/decide", json={"request_id": "d2", "cost": 1}).json()
+    assert d["allowed"] is True
+    assert d["buckets"][0]["balance"] == 99.0
+
+    assert rollback(client, "global", 1).status_code == 200
+    b = client.get("/buckets").json()[0]
+    assert b["capacity"] == 20.0
+    assert b["balance"] == 20.0
+
+
+def test_rollback_refills_with_current_policy_before_clamp(client):
+    # 当前容量 100、速率 100，回滚目标容量 200（放大）：
+    # 先按当前策略补充（上限 100），再截到 200 -> 100（不是目标容量 200）。
+    put_policy(client, "global", 200, 0)                    # v1
+    client.post("/decide", json={"request_id": "d1", "cost": 150})  # 余 50
+    put_policy(client, "global", 100, 100)                  # v2，落库余额 50
+    import time
+    time.sleep(0.7)  # 50 + 100*0.7 = 120 -> 按当前容量封顶 100
+    r = rollback(client, "global", 1)
+    assert r.status_code == 200
+    assert client.get("/buckets").json()[0]["balance"] == 100.0
+
+
+def test_rollback_errors(client):
+    put_policy(client, "global", 10, 0)
+    # 未知策略 -> 404
+    assert rollback(client, "tenant", 1, tenant="nope").status_code == 404
+    # 未知版本 -> 404
+    assert rollback(client, "global", 99).status_code == 404
+    assert rollback(client, "global", 0).status_code == 422
+    # 非法 scope 组合 -> 422
+    assert rollback(client, "tenant", 1).status_code == 422
+
+
+def test_rollblock_blocked_by_pending_change(client):
+    put_policy(client, "global", 100, 0)  # v1
+    put_policy(client, "global", 50, 0)   # v2
+    post_change(client, "ch1", "global", 20, 0, effective_in=3600)
+    # 有 pending：回滚 409，策略与历史不变
+    r = rollback(client, "global", 1)
+    assert r.status_code == 409
+    p = client.get("/policies").json()[0]
+    assert p["capacity"] == 50.0
+    assert [v["version"] for v in history(client, "global").json()] == [2, 1]
+    # 取消后可以回滚
+    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert rollback(client, "global", 1).status_code == 200
+
+
+def test_scheduled_change_application_appends_version(client):
+    put_policy(client, "global", 100, 0)  # v1 put
+    post_change(client, "ch1", "global", 50, 0, effective_in=1)
+    assert [v["version"] for v in history(client, "global").json()] == [1]
+
+    import time
+    time.sleep(1.2)
+    client.post("/decide", json={"request_id": "d1", "cost": 1})
+    h = history(client, "global").json()
+    assert [v["version"] for v in h] == [2, 1]
+    v2 = h[0]
+    assert v2["source"] == "scheduled"
+    assert v2["change_id"] == "ch1"
+    assert v2["restored_from_version"] is None
+    assert v2["capacity"] == 50.0
+
+
+def test_rollback_after_scheduled_change(client):
+    put_policy(client, "global", 100, 0)  # v1 put
+    post_change(client, "ch1", "global", 50, 0, effective_in=1)
+    import time
+    time.sleep(1.2)
+    client.post("/decide", json={"request_id": "d1", "cost": 1})  # v2 scheduled
+    # 回到变更前的 v1
+    r = rollback(client, "global", 1)
+    assert r.status_code == 200
+    assert r.json()["source"] == "rollback"
+    assert r.json()["restored_from_version"] == 1
+    assert client.get("/policies").json()[0]["capacity"] == 100.0
+    h = history(client, "global").json()
+    assert [v["version"] for v in h] == [3, 2, 1]
+    assert [v["source"] for v in h] == ["rollback", "scheduled", "put"]
+    # 已应用的变更不受影响，且 applied 后无 pending，回滚不被阻挡
+    assert client.get("/policy-changes/ch1").json()["status"] == "applied"
+
+
+def test_old_database_is_backfilled_with_baseline_versions(tmp_path):
+    """老库升级：现有策略补登 version=1 baseline，随后变更从 version 2 递增。"""
+    import sqlite3
+
+    from app import database, quota
+
+    db_file = tmp_path / "oldv.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "CREATE TABLE policies ("
+        "  scope TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '',"
+        "  route_id TEXT NOT NULL DEFAULT '', capacity REAL NOT NULL,"
+        "  refill_rate REAL NOT NULL, updated_at TEXT NOT NULL,"
+        "  PRIMARY KEY (scope, tenant_id, route_id)) STRICT"
+    )
+    conn.execute(
+        "INSERT INTO policies VALUES ('global', '', '', 10, 1, '2026-01-01T00:00:00Z')"
+    )
+    conn.commit()
+    conn.close()
+
+    database.init_db(str(db_file))
+    conn = database.connect(str(db_file))
+    try:
+        from app.database import write_tx
+
+        with write_tx(conn):
+            h = quota.list_policy_versions(conn, scope="global")
+            assert len(h) == 1
+            assert h[0]["version"] == 1
+            assert h[0]["source"] == "baseline"
+            assert h[0]["capacity"] == 10.0
+            assert h[0]["created_at"] == "2026-01-01T00:00:00Z"
+            # baseline 可直接作为回滚目标
+            rolled = quota.rollback_policy(
+                conn, scope="global", tenant_id=None, route_id=None, version=1
+            )
+            assert rolled["version"] == 2
+            assert rolled["source"] == "rollback"
+            assert rolled["restored_from_version"] == 1
+        # 再次 init_db 幂等：不重复补登
+        database.init_db(str(db_file))
+        with write_tx(conn):
+            h2 = quota.list_policy_versions(conn, scope="global")
+        assert [v["version"] for v in h2] == [2, 1]
+        assert sum(v["source"] == "baseline" for v in h2) == 1
+    finally:
+        conn.close()
+
+
+def test_policy_versions_are_append_only(tmp_path):
+    """审计表在数据库层拒绝 UPDATE / DELETE（触发器）。"""
+    import sqlite3
+
+    from app import database, quota
+
+    db_file = tmp_path / "imm.db"
+    database.init_db(str(db_file))
+    conn = database.connect(str(db_file))
+    try:
+        with database.write_tx(conn):
+            quota.upsert_policy(
+                conn, scope="global", tenant_id=None, route_id=None,
+                capacity=10, refill_rate=1,
+            )
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("UPDATE policy_versions SET capacity=999 WHERE version=1")
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("DELETE FROM policy_versions WHERE version=1")
+        # 记录完好无损，且仍可继续追加
+        with database.write_tx(conn):
+            quota.upsert_policy(
+                conn, scope="global", tenant_id=None, route_id=None,
+                capacity=11, refill_rate=1,
+            )
+        rows = conn.execute(
+            "SELECT version, capacity FROM policy_versions ORDER BY version"
+        ).fetchall()
+        assert [(r[0], r[1]) for r in rows] == [(1, 10.0), (2, 11.0)]
+    finally:
+        conn.close()

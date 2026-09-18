@@ -39,6 +39,16 @@
   时余额为 `0`）；③ 桶时间锚点移到 `effective_at`，此后按**新速率**继续补充。
   变更落库（换算余额 + 覆盖策略 + 标记 applied）与本次裁决原子完成，
   并发请求只能观察到完整的旧状态或完整的新状态。
+- **策略版本审计与回滚**：每次 `PUT /policies` 成功、定时切换**实际生效**、
+  回滚成功，都会在**同一写事务内**追加一条**不可变**版本记录（同策略
+  `version` 从 1 开始单调递增），内容包含完整参数（容量/速率/阈值）、
+  变更来源（`put` / `scheduled` / `rollback`，老库升级补登为 `baseline`）、
+  关联信息（定时变更的 `change_id`、回滚的 `restored_from_version`）与时间。
+  `GET /policies/history` 按 `scope` + `tenant_id` + `route_id` 查询，
+  新版本在前；`POST /policies/rollback` 提交策略键与目标 `version`，
+  在**同一 `BEGIN IMMEDIATE` 写事务**内恢复该版本参数，已有桶先按**当前**
+  策略补充到事务时刻、再按目标容量截断，并追加一条 `source=rollback` 的新版本。
+  策略存在 `pending` 定时变更时回滚返回 **409**；未知策略或版本返回 **404**。
 - **并发不超发**：SQLite 处于 WAL 模式，写事务一律 `BEGIN IMMEDIATE` 立即加写锁，
   配合 `busy_timeout=30s` 让并发写者排队，读-改-写序列天然串行化。
   单进程多线程、多进程（多个实例共享同一数据库文件）下均不会超发。
@@ -67,7 +77,9 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 | --- | --- | --- |
 | `GET`  | `/health` | 健康检查 |
 | `GET`  | `/policies` | 列出全部策略 |
-| `PUT`  | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert）；该策略有 pending 变更时返回 409 |
+| `PUT`  | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert）；该策略有 pending 变更时返回 409；成功后追加一条 `put` 版本 |
+| `GET`  | `/policies/history` | 按 scope/tenant_id/route_id 查询单策略的不可变版本历史（新版本在前） |
+| `POST` | `/policies/rollback` | 在同一写事务内把策略恢复到指定历史版本并追加 `rollback` 版本；有 pending 变更时 409，未知策略/版本 404 |
 | `POST` | `/policy-changes` | 为已存在的策略提交一条未来生效的定时切换 |
 | `GET`  | `/policy-changes` | 列出定时变更（可按 `status` / 策略键过滤） |
 | `GET`  | `/policy-changes/{change_id}` | 查询单条定时变更 |
@@ -383,6 +395,99 @@ curl -s -X POST http://localhost:8000/decide \
 curl -s http://localhost:8000/policy-changes/chg-1
 ```
 
+### 9. 策略版本审计与回滚
+
+每次 `PUT /policies` 成功与定时切换实际生效，都会为该策略追加一条不可变版本：
+
+```bash
+# 查询某策略的版本历史（按版本号新到旧返回）
+curl -s 'http://localhost:8000/policies/history?scope=global'
+curl -s 'http://localhost:8000/policies/history?scope=tenant&tenant_id=acme'
+curl -s 'http://localhost:8000/policies/history?scope=route&tenant_id=acme&route_id=/v1/search'
+```
+
+版本对象：
+
+```json
+[
+  {
+    "version": 3,
+    "scope": "global",
+    "tenant_id": null,
+    "route_id": null,
+    "capacity": 20.0,
+    "refill_rate": 2.0,
+    "low_balance_threshold": 3.0,
+    "source": "scheduled",
+    "change_id": "chg-1",
+    "restored_from_version": null,
+    "created_at": "2026-09-18T00:00:00.000000Z"
+  },
+  {
+    "version": 2,
+    "scope": "global",
+    "tenant_id": null,
+    "route_id": null,
+    "capacity": 100.0,
+    "refill_rate": 0.0,
+    "low_balance_threshold": null,
+    "source": "put",
+    "change_id": null,
+    "restored_from_version": null,
+    "created_at": "2026-09-17T12:56:09.556564Z"
+  },
+  {
+    "version": 1,
+    "scope": "global",
+    "tenant_id": null,
+    "route_id": null,
+    "capacity": 10.0,
+    "refill_rate": 0.5,
+    "low_balance_threshold": null,
+    "source": "put",
+    "change_id": null,
+    "restored_from_version": null,
+    "created_at": "2026-09-17T12:00:00.000000Z"
+  }
+]
+```
+
+> `source` 取值：`put`（`PUT /policies` 成功）、`scheduled`（定时切换由裁决
+> 事务实际应用，`change_id` 指向对应变更）、`rollback`（回滚产生，
+> `restored_from_version` 指向被恢复的版本）、`baseline`（老库升级时按当时
+> 策略补登的 version=1）。
+
+回滚到指定版本（恢复参数 + 桶补充后截断 + 追加新版本在同一写事务内完成）：
+
+```bash
+curl -s -X POST http://localhost:8000/policies/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"global","version":1}'
+```
+
+```json
+{
+  "version": 4,
+  "scope": "global",
+  "tenant_id": null,
+  "route_id": null,
+  "capacity": 10.0,
+  "refill_rate": 0.5,
+  "low_balance_threshold": null,
+  "source": "rollback",
+  "change_id": null,
+  "restored_from_version": 1,
+  "created_at": "2026-09-18T09:30:00.000000Z"
+}
+```
+
+> - 回滚不是「跳到旧版本」：恢复后产生的是一个**新版本号**，版本链只增不改；
+> - 已有桶先按**当前**策略补充到事务时刻，再按目标版本容量截断
+>   （放大容量时余额不会凭空变满）；
+> - 策略存在 `pending` 定时变更时返回 `409`，请先取消或等其生效；
+> - 目标策略不存在、或该版本不属于该策略，返回 `404`；
+> - 回滚成功后无 `pending` 变更，可正常继续 PUT / 提交定时切换 / 再次回滚。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -397,7 +502,12 @@ curl -s http://localhost:8000/policy-changes/chg-1
   `旧余额 / 旧容量 × 新容量`（旧容量为 `0` 时余额为 `0`，随后按新速率从 0 补充）
   → 按新速率从 `effective_at` 补充至裁决时刻。新容量更小时换算结果以新容量为上限。
 - 取消只对生效时刻仍在未来的 `pending` 变更有效；已应用的不可撤销
-  （如需回退，再用 `PUT /policies` 或提交一条反向变更）。
+  （如需回退，再用 `PUT /policies`、提交一条反向变更，或直接
+  `POST /policies/rollback` 回到历史版本）。
+- 版本记录只追加、不修改、不删除：同一策略的 `version` 在写事务内
+  `max(version)+1` 单调分配；PUT、定时切换生效、回滚三个来源与触发动作
+  在同一 `BEGIN IMMEDIATE` 事务内提交。老库启动时自动为现有策略补登
+  version=1 的 `baseline`（幂等），历史策略因此也可直接回滚。
 - 低余额事件只在**获准**裁决的扣减事务内产生：拒绝、幂等重放、
   撤销与策略更新/变更应用本身都不写事件；一次裁决中每个越线桶各写一条。
 - 阈值判定为「扣减前余额 > 阈值 ≥ 扣减后余额」；余额本就在阈值之下的
@@ -431,14 +541,18 @@ QUOTA_DB_PATH=./quota.db .venv/bin/uvicorn app.main:app --reload --port 8000
 生效前取消与到期不可取消、生效前后裁决的策略可见性、
 余额按旧率补充再按比例缩放再走新率、旧容量 0 归零、
 新阈值到期生效、多级变更在同一事务内应用、两阶段并发下新旧状态不串且不超发，
-以及 20+ 线程并发与双进程共享同一数据库文件均不超发。
+以及 20+ 线程并发与双进程共享同一数据库文件均不超发；
+策略版本审计覆盖 PUT/定时生效/回滚三个来源的版本号单调递增、
+按策略键新到旧查询、老库 baseline 补登（含幂等）、回滚恢复参数并追加
+rollback 版本、桶先按当前策略补充再按目标容量截断、pending 409 与
+未知策略/版本 404。
 
 ## 项目结构
 
 ```
 app/
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表与老库迁移
-  quota.py      # 策略 upsert、定时切换登记/取消/到期应用、惰性补充、整组裁决、幂等存档、撤销与低余额事件
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表与老库迁移（含 baseline 版本补登）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、幂等存档、撤销与低余额事件
   schemas.py    # Pydantic 请求/响应模型
   main.py       # FastAPI 路由
 tests/

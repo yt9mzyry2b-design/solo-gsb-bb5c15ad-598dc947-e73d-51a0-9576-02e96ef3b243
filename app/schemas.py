@@ -31,6 +31,27 @@ class PolicyOut(BaseModel):
     updated_at: str
 
 
+class PolicyRollbackIn(BaseModel):
+    scope: Literal["global", "tenant", "route"]
+    tenant_id: Optional[str] = Field(default=None, description="scope=tenant/route 时必填")
+    route_id: Optional[str] = Field(default=None, description="scope=route 时必填")
+    version: int = Field(..., ge=1, description="要恢复到的历史版本号")
+
+
+class PolicyVersionOut(BaseModel):
+    scope: str
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    version: int
+    capacity: float
+    refill_rate: float
+    low_balance_threshold: Optional[float]
+    source: Literal["put", "scheduled", "rollback", "baseline"]
+    change_id: Optional[str] = None
+    restored_from_version: Optional[int] = None
+    created_at: str
+
+
 class PolicyChangeIn(BaseModel):
     change_id: str = Field(..., min_length=1, description="变更幂等键，全局唯一")
     scope: Literal["global", "tenant", "route"]
